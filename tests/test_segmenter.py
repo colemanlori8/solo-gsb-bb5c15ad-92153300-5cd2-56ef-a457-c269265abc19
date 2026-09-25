@@ -226,6 +226,191 @@ class TestSegmentation(unittest.TestCase):
             )
 
 
+class TestLineLayout(unittest.TestCase):
+    """Optional ``max_line_chars`` two-line layout behaviour."""
+
+    def test_omitted_keeps_single_line_and_unchanged_cost(self):
+        without = _segment(["Hello", "world", "bye"], dur_ms=500)
+        wide = _segment(
+            ["Hello", "world", "bye"], dur_ms=500, max_line_chars=1000
+        )
+        self.assertEqual(
+            [s.text for s in without.segments],
+            [s.text for s in wide.segments],
+        )
+        self.assertAlmostEqual(without.total_cost, wide.total_cost, places=9)
+        for seg in wide.segments:
+            self.assertNotIn("\n", seg.text)
+
+    def test_single_line_fitting_has_zero_layout_cost(self):
+        # One subtitle exactly matching its target duration; a width that
+        # still fits the joined text must keep the total cost at zero.
+        words = [W("ab", 0, 1000), W("cd", 1000, 2000)]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=0,
+            max_duration_ms=100000,
+            target_duration_ms=2000,
+            pause_threshold_ms=1000,
+            max_line_chars=5,  # "ab cd" is exactly 5
+        )
+        self.assertEqual(len(result.segments), 1)
+        self.assertEqual(result.segments[0].text, "ab cd")
+        self.assertAlmostEqual(result.total_cost, 0.0, places=9)
+
+    def test_balanced_two_line_break_with_spaces(self):
+        # Six 2-char words join to "aa bb cc dd ee ff" (17 chars). Width 9:
+        # the only balanced legal break is after word 2 -> lines 8/8.
+        words = [W(t, i * 400, (i + 1) * 400) for i, t in enumerate(
+            ["aa", "bb", "cc", "dd", "ee", "ff"]
+        )]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=0,
+            max_duration_ms=100000,
+            target_duration_ms=2400,
+            pause_threshold_ms=1000,
+            max_line_chars=9,
+        )
+        self.assertEqual(len(result.segments), 1)
+        seg = result.segments[0]
+        self.assertEqual(seg.text, "aa bb cc\ndd ee ff")
+        line1, line2 = seg.text.split("\n")
+        self.assertEqual(len(line1), 8)
+        self.assertEqual(len(line2), 8)
+        self.assertAlmostEqual(result.total_cost, 0.0, places=9)
+
+    def test_line_balance_cost_added_to_total(self):
+        # Forced single subtitle (min duration), width 3:
+        # "a a" is 3 characters but > width ... it fits exactly (3 <= 3),
+        # so instead use two words joining to 5 chars; width 2 forces the
+        # break "a"/"a" with diff 0, duration 2 s vs target 1 s -> cost 1.
+        words = [W("a", 0, 1000), W("a", 1000, 2000)]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=1500,
+            max_duration_ms=100000,
+            target_duration_ms=1000,
+            pause_threshold_ms=1000,
+            max_line_chars=2,
+        )
+        self.assertEqual(result.segments[0].text, "a\na")
+        self.assertAlmostEqual(result.total_cost, 1.0, places=9)
+
+    def test_unbalanced_break_pays_squared_difference(self):
+        # CJK words (no joining spaces): "今天天" + "气好" = 5 chars, width 3.
+        # The only legal break yields lines 3/2 -> (3-2)^2 / 3^2 = 1/9 on
+        # top of the zero duration cost.
+        words = [W("今天天", 0, 1000), W("气好", 1000, 2000)]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=0,
+            max_duration_ms=100000,
+            target_duration_ms=2000,
+            pause_threshold_ms=1000,
+            max_line_chars=3,
+        )
+        self.assertEqual(result.segments[0].text, "今天天\n气好")
+        self.assertAlmostEqual(result.total_cost, 1 / 9, places=9)
+
+    def test_tie_prefers_earlier_break_point(self):
+        # "ab cd ef": width 5 allows breaks after word 0 (2/5) and after
+        # word 1 (5/2); both cost (3/5)^2, so the earlier break wins.
+        words = [W(t, i * 400, (i + 1) * 400) for i, t in enumerate(
+            ["ab", "cd", "ef"]
+        )]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=0,
+            max_duration_ms=100000,
+            target_duration_ms=1200,
+            pause_threshold_ms=1000,
+            max_line_chars=5,
+        )
+        self.assertEqual(result.segments[0].text, "ab\ncd ef")
+
+    def test_cjk_chain_tie_prefers_earlier_break(self):
+        # Three 2-char CJK words, width 4: breaks after word 0 (2/4) and
+        # word 1 (4/2) both have diff 2; the earlier one wins.
+        words = [W(t, i * 400, (i + 1) * 400) for i, t in enumerate(
+            ["你好", "世界", "再见"]
+        )]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=0,
+            max_duration_ms=100000,
+            target_duration_ms=1200,
+            pause_threshold_ms=1000,
+            max_line_chars=4,
+        )
+        self.assertEqual(result.segments[0].text, "你好\n世界再见")
+
+    def test_breaks_only_between_words_and_lines_within_width(self):
+        texts = ["one", "two", "three", "four", "five", "six"]
+        result = _segment(texts, dur_ms=400, max_line_chars=10)
+        # Reconstructed words, in order, must cover every input word once.
+        seen = []
+        for seg in result.segments:
+            lines = seg.text.split("\n")
+            self.assertLessEqual(len(lines), 2)
+            for line in lines:
+                self.assertLessEqual(len(line), 10)
+            seen.extend(seg.text.replace("\n", " ").split(" "))
+        self.assertEqual(seen, texts)
+
+    def test_no_legal_layout_raises(self):
+        # Three words inside a short span: min_duration forces each subtitle
+        # to span at least two words, but width 1 cannot hold even a two-word
+        # "a a" line, so no candidate layout is legal.
+        with self.assertRaises(SegmentationError) as ctx:
+            segment_words(
+                [W("a", 0, 300), W("b", 300, 600), W("c", 600, 900)],
+                max_chars=100,
+                min_duration_ms=500,
+                max_duration_ms=100000,
+                target_duration_ms=500,
+                pause_threshold_ms=1000,
+                max_line_chars=1,
+            )
+        self.assertIn("no legal segmentation", str(ctx.exception))
+        self.assertIn("max_line_chars=1", str(ctx.exception))
+
+    def test_word_wider_than_line_raises(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            segment_words(
+                [W("abcdef", 0, 100)],
+                max_chars=100,
+                min_duration_ms=0,
+                max_duration_ms=100000,
+                target_duration_ms=1000,
+                pause_threshold_ms=1000,
+                max_line_chars=3,
+            )
+        self.assertIn("max_line_chars", str(ctx.exception))
+
+    def test_srt_emits_line_break(self):
+        words = [W("a", 0, 1000), W("a", 1000, 2000)]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=1500,
+            max_duration_ms=100000,
+            target_duration_ms=2000,
+            pause_threshold_ms=1000,
+            max_line_chars=2,
+        )
+        srt = to_srt(result.segments)
+        self.assertEqual(
+            srt, "1\n00:00:00,000 --> 00:00:02,000\na\na\n"
+        )
+
+
 class TestSRT(unittest.TestCase):
     def test_timestamp(self):
         self.assertEqual(format_timestamp(0), "00:00:00,000")

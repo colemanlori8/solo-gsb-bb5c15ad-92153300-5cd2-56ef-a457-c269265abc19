@@ -116,6 +116,48 @@ class TestAPI(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 200, r.text)
 
+    def test_max_line_chars_returns_newline_split_text(self):
+        # "How are you doing today?" is 23 chars; a width of 12 forces a
+        # two-line layout with a break between words only.
+        body = {**BODY, "max_line_chars": 12}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        for seg in r.json()["segments"]:
+            lines = seg["text"].split("\n")
+            self.assertLessEqual(len(lines), 2)
+            for line in lines:
+                self.assertLessEqual(len(line), 12)
+
+    def test_max_line_chars_appears_in_srt(self):
+        body = {**BODY, "max_line_chars": 12}
+        r = self.client.post("/segment/srt", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        # at least one subtitle block must carry two text lines
+        # (block = sequence number + timing line + two text lines)
+        blocks = r.text.strip().split("\n\n")
+        self.assertTrue(any(len(b.split("\n")) >= 4 for b in blocks))
+
+    def test_422_when_no_layout_possible(self):
+        words = [
+            _word("a", 0, 300),
+            _word("b", 300, 600),
+            _word("c", 600, 900),
+        ]
+        body = {
+            "words": words,
+            "min_duration_ms": 500,
+            "max_duration_ms": 7000,
+            "max_line_chars": 1,
+        }
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("max_line_chars", r.json()["detail"])
+
+    def test_422_on_non_positive_max_line_chars(self):
+        body = {**BODY, "max_line_chars": 0}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,8 @@ app = FastAPI(
         "Split a word-level transcript into subtitles with a dynamic-programming "
         "optimiser. Total cost = sum of squared deviations of subtitle durations "
         "(seconds) from the target duration, plus a 4-point penalty for every "
-        "crossed sentence-ending-punctuation or long-pause boundary; ties are "
+        "crossed sentence-ending-punctuation or long-pause boundary, plus a "
+        "two-line line-balance cost when max_line_chars is given; ties are "
         "broken in favour of fewer subtitles."
     ),
 )
@@ -57,6 +58,7 @@ def _run(req: SegmentRequest) -> SegmentationResult:
             max_duration_ms=req.max_duration_ms,
             target_duration_ms=req.target_duration_ms,
             pause_threshold_ms=req.pause_threshold_ms,
+            max_line_chars=req.max_line_chars,
         )
     except SegmentationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
