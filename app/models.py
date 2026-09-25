@@ -49,6 +49,17 @@ class SegmentRequest(BaseModel):
         ge=0,
         description="gap (ms) between words that counts as a long pause",
     )
+    max_line_chars: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "optional line width for at-most-two-line typesetting: when set, "
+            "each subtitle is laid out on one or two lines that break only "
+            "between words, with every line no longer than this many "
+            "characters (joining spaces included); omitted to keep plain "
+            "single-line output"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_limits(self) -> "SegmentRequest":

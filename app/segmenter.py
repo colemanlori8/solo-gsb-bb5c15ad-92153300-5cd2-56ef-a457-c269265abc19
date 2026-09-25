@@ -8,15 +8,26 @@ into subtitles that:
 * covers every word exactly once and keeps the original order;
 * gives every subtitle at most ``max_chars`` characters and a duration
   within ``[min_duration_ms, max_duration_ms]`` (hard constraints);
+* when ``max_line_chars`` is given, every subtitle must fit on at most two
+  lines of that width; lines may only break *between* words and each line
+  (including joining spaces) must be no longer than ``max_line_chars``;
 * minimises the total cost::
 
       sum over subtitles of (duration_s - target_s) ** 2
       + 4 * (number of crossed natural boundaries)
+      + line-layout cost (only when max_line_chars is given)
 
   where a *natural boundary* sits between two consecutive words when the
   first ends with sentence-ending punctuation or the gap between them is
   at least ``pause_threshold_ms``.  A boundary is "crossed" when it falls
   inside a subtitle rather than on its edge.
+
+  The *line-layout cost* of a subtitle is 0 when its text fits on one line;
+  otherwise every legal two-line break is considered and the minimum of
+  ``(len(line1) - len(line2)) ** 2 / max_line_chars ** 2`` is taken (the
+  earlier breakpoint wins ties).  A subtitle that admits no legal layout
+  (e.g. its words cannot be split into two width-respecting lines) is not
+  a valid candidate; if no segmentation remains, the caller gets an error.
 * ties (equal total cost) are broken in favour of fewer subtitles.
 
 A classic O(n^2) dynamic program over word positions solves this exactly.
@@ -24,6 +35,7 @@ A classic O(n^2) dynamic program over word positions solves this exactly.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
@@ -95,6 +107,79 @@ def ends_with_sentence_punctuation(text: str) -> bool:
     return bool(stripped) and stripped[-1] in SENTENCE_ENDING_CHARS
 
 
+def _best_layout(
+    i: int,
+    j: int,
+    cum_len: Sequence[int],
+    space_before: Sequence[int],
+    width: int,
+) -> tuple[int, float] | None:
+    """Best two-line (or one-line) layout for the words spanning ``i..j``.
+
+    ``cum_len`` is a prefix-length array built as
+    ``cum_len[k + 1] = cum_len[k] + len(word_k) + space_before[k]`` (the
+    joining space sits *before* its word), and ``space_before[k]`` is 1 when
+    a joining space precedes word ``k``.  Words ``a..b`` joined normally have
+    length ``cum_len[b + 1] - cum_len[a] - space_before[a]`` (the space
+    before the first word is not part of the span).
+
+    Returns ``(first_word_of_line_2, cost)`` (``-1`` marks a single line),
+    or ``None`` when no legal layout exists.  A break before word ``m``
+    (``i < m <= j``) puts words ``i..m-1`` on line 1 and ``m..j`` on line 2:
+
+    * line 1 length = ``cum_len[m] - cum_len[i] - space_before[i]``
+    * line 2 length = ``cum_len[j + 1] - cum_len[m] - space_before[m]``
+
+    the joining space at the break being replaced by the newline.  The cost
+    is 0 for a single line; otherwise it is the minimum over legal breaks of
+    ``(line1_len - line2_len) ** 2 / width ** 2``, with the earlier break
+    winning ties.
+    """
+    total = cum_len[j + 1] - cum_len[i] - space_before[i]
+    if total <= width:
+        return -1, 0.0
+
+    # ---- legal break range via binary search ------------------------------
+    # Line 1 fits: cum_len[m] <= cum_len[i] + space_before[i] + width
+    # Line 2 fits: cum_len[m] + space_before[m] >= cum_len[j+1] - width
+    target_lo = cum_len[j + 1] - width
+    p = bisect_left(cum_len, target_lo, i + 1, j + 1)
+    lo = p
+    # When word m starts a Latin line (space_before[m] == 1), line 2 gets
+    # one character back, so the position one step before the bisect point
+    # may also satisfy the lower bound.
+    if p - 1 >= i + 1 and cum_len[p - 1] + space_before[p - 1] >= target_lo:
+        lo = p - 1
+    hi = bisect_right(
+        cum_len, cum_len[i] + space_before[i] + width, i + 1, j + 1
+    ) - 1
+    if lo > hi:
+        return None
+
+    # D(m) = line1 - line2 = 2*cum_len[m] + space_before[m]
+    #        - cum_len[i] - space_before[i] - cum_len[j+1]
+    # is strictly increasing in m, so the minimum absolute difference is at
+    # the one or two legal breaks straddling D = 0.
+    balance = (cum_len[i] + space_before[i] + cum_len[j + 1]) / 2.0
+    q = bisect_left(cum_len, balance, lo, hi + 1)
+
+    def _diff(m: int) -> int:
+        line1 = cum_len[m] - cum_len[i] - space_before[i]
+        line2 = cum_len[j + 1] - cum_len[m] - space_before[m]
+        return line1 - line2
+
+    best_m = None
+    best_diff: int | None = None
+    for m in (q - 1, q):  # earlier break first -> it wins an exact tie
+        if lo <= m <= hi:
+            d = abs(_diff(m))
+            if best_diff is None or d < best_diff:
+                best_diff = d
+                best_m = m
+    assert best_m is not None and best_diff is not None
+    return best_m, (best_diff**2) / width**2
+
+
 def segment_words(
     words: Sequence[WordLike],
     *,
@@ -103,6 +188,7 @@ def segment_words(
     max_duration_ms: int,
     target_duration_ms: int,
     pause_threshold_ms: int,
+    max_line_chars: int | None = None,
 ) -> SegmentationResult:
     n = len(words)
     if n == 0:
@@ -121,6 +207,11 @@ def segment_words(
             raise SegmentationError(
                 f"word {idx} ({w.text!r}) is {len(w.text)} characters and can "
                 f"never fit within max_chars={max_chars}"
+            )
+        if max_line_chars is not None and len(w.text) > max_line_chars:
+            raise SegmentationError(
+                f"word {idx} ({w.text!r}) is {len(w.text)} characters and can "
+                f"never fit within max_line_chars={max_line_chars}"
             )
         word_dur = w.end_ms - w.start_ms
         if word_dur > max_duration_ms:
@@ -154,6 +245,14 @@ def segment_words(
     for k in range(1, n):
         space_before[k] = 1 if _needs_space(words[k - 1].text, words[k].text) else 0
 
+    # cum_len[k+1] = length of the joined words 0..k with each word's
+    # joining space stored in front of it.  Strictly increasing; the joined
+    # length of an interior span a..b is cum_len[b+1] - cum_len[a] -
+    # space_before[a] (the space before the span's first word is excluded).
+    cum_len = [0] * (n + 1)
+    for k in range(n):
+        cum_len[k + 1] = cum_len[k] + len(words[k].text) + space_before[k]
+
     # ---- dynamic programming ----------------------------------------------
     INF = float("inf")
     EPS = 1e-9
@@ -161,6 +260,8 @@ def segment_words(
     dp_count = [0] * (n + 1)
     dp_cost[n] = 0.0
     nxt = [-1] * (n + 1)  # nxt[i] = inclusive end index of the segment starting at i
+    # nxt_break[i] = first word of the chosen segment's second line (-1 = one line)
+    nxt_break = [-1] * (n + 1)
     target_s = target_duration_ms / 1000.0
 
     for i in range(n - 1, -1, -1):
@@ -172,6 +273,13 @@ def segment_words(
             dur_ms = words[j].end_ms - words[i].start_ms
             if dur_ms > max_duration_ms:
                 break  # only grows as j grows
+            if max_line_chars is not None:
+                layout = _best_layout(i, j, cum_len, space_before, max_line_chars)
+                if layout is None:
+                    break  # wider spans starting at i stay unlayoutable
+                break_word, line_cost = layout
+            else:
+                break_word, line_cost = -1, 0.0
             if dur_ms < min_duration_ms or dp_cost[j + 1] == INF:
                 continue
             crossed = nat_prefix[j] - nat_prefix[i]
@@ -179,6 +287,7 @@ def segment_words(
             cost = (
                 (dur_s - target_s) ** 2
                 + CROSSED_BOUNDARY_PENALTY * crossed
+                + line_cost
                 + dp_cost[j + 1]
             )
             count = 1 + dp_count[j + 1]
@@ -188,14 +297,19 @@ def segment_words(
                 dp_cost[i] = cost
                 dp_count[i] = count
                 nxt[i] = j
+                nxt_break[i] = break_word
 
     if dp_cost[0] == INF:
+        layout_note = (
+            f", max_line_chars={max_line_chars}" if max_line_chars is not None else ""
+        )
         raise SegmentationError(
             "no legal segmentation covers all words under the given constraints "
-            f"(max_chars={max_chars}, min_duration_ms={min_duration_ms}, "
-            f"max_duration_ms={max_duration_ms}); every subtitle — including "
-            "the last one — must satisfy the duration limits, so try relaxing "
-            "min_duration_ms or the other limits"
+            f"(max_chars={max_chars}{layout_note}, min_duration_ms="
+            f"{min_duration_ms}, max_duration_ms={max_duration_ms}); every "
+            "subtitle — including the last one — must satisfy the duration "
+            "limits (and, when set, fit on at most two lines of "
+            "max_line_chars), so try relaxing min_duration_ms or the other limits"
         )
 
     # ---- reconstruct the optimal path --------------------------------------
@@ -203,10 +317,20 @@ def segment_words(
     i = 0
     while i < n:
         j = nxt[i]
+        texts = [w.text for w in words[i : j + 1]]
+        bw = nxt_break[i]
+        if bw > 0:
+            text = (
+                join_word_texts(texts[: bw - i])
+                + "\n"
+                + join_word_texts(texts[bw - i :])
+            )
+        else:
+            text = join_word_texts(texts)
         segments.append(
             SegmentResult(
                 index=len(segments),
-                text=join_word_texts([w.text for w in words[i : j + 1]]),
+                text=text,
                 start_ms=words[i].start_ms,
                 end_ms=words[j].end_ms,
                 duration_ms=words[j].end_ms - words[i].start_ms,

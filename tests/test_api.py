@@ -116,6 +116,74 @@ class TestAPI(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 200, r.text)
 
+    def test_max_line_chars_lays_text_out_on_two_lines(self):
+        words = [
+            _word("aaa", 0, 450),
+            _word("bbb", 450, 900),
+            _word("ccc", 900, 1350),
+            _word("ddd", 1350, 1800),
+        ]
+        body = {
+            "words": words,
+            "max_chars": 42,
+            "min_duration_ms": 0,
+            "max_duration_ms": 7000,
+            "target_duration_ms": 2000,
+            "pause_threshold_ms": 500,
+            "max_line_chars": 7,
+        }
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        segs = r.json()["segments"]
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0]["text"], "aaa bbb\nccc ddd")
+        for line in segs[0]["text"].split("\n"):
+            self.assertLessEqual(len(line), 7)
+
+    def test_max_line_chars_srt_uses_newline(self):
+        words = [
+            _word("aaa", 0, 450),
+            _word("bbb", 450, 900),
+            _word("ccc", 900, 1350),
+            _word("ddd", 1350, 1800),
+        ]
+        body = {
+            "words": words,
+            "max_chars": 42,
+            "min_duration_ms": 0,
+            "max_duration_ms": 7000,
+            "target_duration_ms": 2000,
+            "pause_threshold_ms": 500,
+            "max_line_chars": 7,
+        }
+        r = self.client.post("/segment/srt", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("aaa bbb\nccc ddd\n", r.text)
+
+    def test_422_when_line_width_makes_segmentation_impossible(self):
+        words = [
+            _word("aaaa", 0, 400),
+            _word("bbbb", 400, 800),
+            _word("cccc", 800, 1200),
+        ]
+        body = {
+            "words": words,
+            "max_chars": 42,
+            "min_duration_ms": 1000,
+            "max_duration_ms": 7000,
+            "target_duration_ms": 2000,
+            "pause_threshold_ms": 500,
+            "max_line_chars": 4,
+        }
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("no legal segmentation", r.json()["detail"])
+
+    def test_max_line_chars_must_be_positive(self):
+        body = {**BODY, "max_line_chars": 0}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main()
